@@ -147,6 +147,10 @@ function closeMobileHexPopup() {
   clearSelectedHex();
 }
 
+function openGeneratedSubhexEditor(hexId) {
+  window.generatedMapRenderer?.openSubhexEditor?.(hexId);
+}
+
 function getPopupPoiSortRank(poi) {
   const rawValue = String(poi?.["Notoriety Tier_Value"] || poi?.["Notoriety Tier"] || "");
   const matched = rawValue.match(/\d+/)?.[0] || "";
@@ -229,6 +233,7 @@ function buildMobilePopupHtml(hexId, options = {}) {
 
   const info = [];
   const disablePoiLinks = options.detailsDisabled === true || options.disablePoiLinks === true;
+  const showSubhexEdit = options.detailsDisabled === true && options.subhexEditorEnabled === true;
 
   if (counts.npcCount > 0) {
     info.push(`${counts.npcCount} NPC${counts.npcCount !== 1 ? "s" : ""}`);
@@ -252,10 +257,20 @@ function buildMobilePopupHtml(hexId, options = {}) {
       }
       ${renderPopupPoiList(hexId, { disablePoiLinks })}
 
-      <div class="popup-action-row${options.detailsDisabled ? " popup-action-row-editor-preview" : ""}">
+      <div class="popup-action-row${options.detailsDisabled && !showSubhexEdit ? " popup-action-row-editor-preview" : ""}">
         ${
           options.detailsDisabled
-            ? ""
+            ? (
+              showSubhexEdit
+                ? `<button
+                    class="popup-open-subhex"
+                    type="button"
+                    onclick="openGeneratedSubhexEditor('${escapeJsString(hexId)}')"
+                  >
+                    Edit
+                  </button>`
+                : ""
+            )
             : `<button
                 class="popup-open-details"
                 type="button"
@@ -306,4 +321,5 @@ function getPopupTerrainName(data) {
 
 window.openPanelForHex = openPanelForHex;
 window.closeMobileHexPopup = closeMobileHexPopup;
+window.openGeneratedSubhexEditor = openGeneratedSubhexEditor;
 window.zoomToHexFromCodex = zoomToHexFromCodex;
