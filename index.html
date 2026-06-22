@@ -806,7 +806,19 @@
 
       <section class="map-draw-panel-section" data-map-edit-section="nuke">
         <div class="map-draw-section-title">Archive</div>
-        <p class="map-edit-empty-note">No archive tools are active right now.</p>
+        <div class="map-archive-export-panel">
+          <label class="map-draw-style-row" for="map-export-scale">
+            <span>Image Size</span>
+            <select id="map-export-scale">
+              <option value="1">Standard PNG</option>
+              <option value="2" selected>High Resolution 2x</option>
+              <option value="3">High Resolution 3x</option>
+              <option value="4">Poster Resolution 4x</option>
+            </select>
+          </label>
+          <button id="map-export-png" class="map-draw-secondary-button" type="button">Export PNG</button>
+          <div id="map-export-status" class="map-export-status" aria-live="polite"></div>
+        </div>
       </section>
 
       <section class="map-draw-panel-section" data-map-edit-section="pois">

@@ -1531,6 +1531,23 @@
   margin: 5px 0 0;
 }
 
+.map-archive-export-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.map-export-status {
+  min-height: 1.2em;
+  color: rgba(244, 223, 175, 0.78);
+  font-family: 'Spectral', Georgia, serif;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.map-export-status-error {
+  color: rgba(255, 174, 144, 0.94);
+}
+
 @media (max-width: 520px), (max-height: 560px) {
   #map-view-button {
     width: 88px;

@@ -133,6 +133,9 @@
   const SUBHEX_TERRAIN_TILE_SCALE = 2.25;
   const FEATURE_IMAGE_SUPERSAMPLE = 3;
   const SUBHEX_FEATURE_IMAGE_SUPERSAMPLE = 5;
+  const EXPORT_CANVAS_MAX_PIXELS = 268000000;
+  const EXPORT_CANVAS_MAX_SIDE = 32767;
+  const EXPORT_COORD_LABEL_SCALE = 1.35;
   const SUBHEX_FEATURE_TILE_SCALE = 3;
   const SUBHEX_FEATURE_TILE_MAX_SCALE = 4;
   const SUBHEX_PARENT_VIEW_WARMUP_HEX_LIMIT = 8;
@@ -501,6 +504,8 @@
     poiIconAssets: new Map(),
     poiIconAssetsLoading: null,
     poiIconAssetsLoaded: false,
+    poiIconExportImages: new Map(),
+    exportingMap: false,
     initialMapLoadingActive: false,
     initialMapLoadingStartedAt: 0,
     poiHexIds: new Set(),
@@ -1143,6 +1148,8 @@
     const generationResetSliders = document.getElementById("map-generation-reset-sliders");
     const generationOverlayResetSliders = document.getElementById("map-generation-reset-overlay-sliders");
     const generationPreviewTerrain = document.getElementById("map-generation-preview-terrain");
+    const exportPngButton = document.getElementById("map-export-png");
+    const exportScaleSelect = document.getElementById("map-export-scale");
     const sharedApplyButton = document.getElementById("map-editor-apply-staged");
     const sharedDiscardButton = document.getElementById("map-editor-discard-staged");
     const introCloseButton = document.getElementById("map-editor-intro-close");
@@ -1263,6 +1270,11 @@
       event.preventDefault();
       event.stopPropagation();
       activateSurveyorMode("archive");
+    });
+    exportPngButton?.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      exportGeneratedMapPng(Number(exportScaleSelect?.value || 2));
     });
     cartographerManualButton?.addEventListener("click", event => {
       event.preventDefault();
@@ -5093,6 +5105,595 @@
     }
   }
 
+  function setMapExportStatus(message = "", isError = false) {
+    const status = document.getElementById("map-export-status");
+    if (!status) return;
+    status.textContent = message;
+    status.classList.toggle("map-export-status-error", Boolean(isError));
+  }
+
+  function getMapExportScale(value) {
+    const scale = Math.round(Number(value) || 2);
+    return Math.max(1, Math.min(4, scale));
+  }
+
+  function getMapExportFilename(scale) {
+    const campaign = getActiveCampaign?.();
+    const rawName = String(campaign?.name || campaign?.Campaign_Name || "waymark-map").trim();
+    const slug = rawName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      || "waymark-map";
+    return `${slug}-map-${scale}x.png`;
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => window.setTimeout(resolve, ms));
+  }
+
+  async function exportGeneratedMapPng(rawScale = 2) {
+    if (!isActive()) {
+      setMapExportStatus("Open a generated map before exporting.", true);
+      return;
+    }
+
+    const scale = getMapExportScale(rawScale);
+    const pixelWidth = Math.ceil(renderer.view.width * scale);
+    const pixelHeight = Math.ceil(renderer.view.height * scale);
+    const exportPixels = pixelWidth * pixelHeight;
+    if (pixelWidth > EXPORT_CANVAS_MAX_SIDE || pixelHeight > EXPORT_CANVAS_MAX_SIDE || exportPixels > EXPORT_CANVAS_MAX_PIXELS) {
+      setMapExportStatus("That export is too large for this browser. Try a smaller image size.", true);
+      return;
+    }
+
+    const button = document.getElementById("map-export-png");
+    if (button) button.disabled = true;
+    setMapExportStatus(`Preparing ${pixelWidth} x ${pixelHeight} PNG...`);
+
+    try {
+      renderer.exportingMap = true;
+      await Promise.allSettled([
+        loadFeatureArtAssets(),
+        loadRouteIconAssets(),
+        loadPoiIconAssets()
+      ]);
+      const exportResult = await buildGeneratedMapExportCanvas(scale);
+      const canvas = exportResult.canvas || exportResult;
+      await downloadCanvasPng(canvas, getMapExportFilename(scale));
+      if (exportResult.warnings?.length) {
+        setMapExportStatus(`Exported PNG. Missing: ${exportResult.warnings.join(", ")}`, true);
+      } else {
+        setMapExportStatus(`Exported ${pixelWidth} x ${pixelHeight} PNG.`);
+      }
+    } catch (error) {
+      console.error("Generated map export failed:", error);
+      setMapExportStatus(`Export failed: ${error?.message || "Try a smaller image size."}`, true);
+    } finally {
+      renderer.exportingMap = false;
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function buildGeneratedMapExportCanvas(scale) {
+    const width = Math.ceil(renderer.view.width * scale);
+    const height = Math.ceil(renderer.view.height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas export is not available.");
+
+    drawGeneratedMapExportRaster(ctx, scale, width, height);
+    await waitForFeatureImagesForExport();
+    drawGeneratedMapExportRaster(ctx, scale, width, height);
+    ctx.save();
+    ctx.scale(scale, scale);
+    drawGeneratedMapExportGridLines(ctx);
+    ctx.restore();
+    ctx.save();
+    ctx.scale(scale, scale);
+    drawGeneratedMapExportGeographicRegionLayer(ctx, { fills: true, outlines: true });
+    ctx.restore();
+    const warnings = await drawGeneratedMapExportSvgLayers(ctx, scale, width, height);
+    ctx.save();
+    ctx.scale(scale, scale);
+    drawGeneratedMapExportPoliticalRegionBorders(ctx);
+    await drawGeneratedMapExportPoiMarkers(ctx);
+    ctx.restore();
+    return { canvas, warnings };
+  }
+
+  function drawGeneratedMapExportRaster(ctx, scale, width, height) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.save();
+    ctx.scale(scale, scale);
+    renderer.hexes.forEach(hex => drawCanvasPolygon(ctx, hex.points, hex.fill));
+
+    if (renderer.drawing.visibleOverlays.features && shouldRenderFeatureArt()) {
+      renderer.hexes.forEach(hex => renderFarmlandOverlayForHex(ctx, hex));
+    }
+    renderCanvasDrawablePaths(ctx);
+
+    ctx.save();
+    clipToMapHexArea(ctx);
+    renderer.hexes.forEach(hex => renderEdgeBleedForHex(ctx, hex));
+    if (renderer.drawing.visibleOverlays.features) {
+      renderFeatureLayer(ctx, renderer.hexes);
+    }
+    ctx.restore();
+
+    if (renderer.drawing.visibleOverlays.mist && shouldRenderFeatureArt()) {
+      renderCanvasMistOverlays(ctx);
+    }
+    ctx.restore();
+  }
+
+  function drawGeneratedMapExportGridLines(ctx) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.22)";
+    ctx.lineWidth = 1.35;
+    ctx.globalAlpha = getGridLineOpacity();
+    ctx.lineCap = "butt";
+    ctx.lineJoin = "miter";
+
+    const drawn = new Set();
+    renderer.hexes.forEach(hex => {
+      hex.points.forEach((point, index) => {
+        const next = hex.points[(index + 1) % hex.points.length];
+        const key = edgeKey(point, next);
+        if (drawn.has(key)) return;
+        drawn.add(key);
+        ctx.beginPath();
+        ctx.moveTo(point.x, point.y);
+        ctx.lineTo(next.x, next.y);
+        ctx.stroke();
+      });
+    });
+    ctx.restore();
+  }
+
+  async function drawGeneratedMapExportPoiMarkers(ctx) {
+    if (!renderer.drawing.visibleOverlays.pois) return;
+    const dimensions = getGeneratedMapDimensions();
+    const markerDiameter = Math.min(70, Math.max(56, (dimensions.radius * 2) - 6));
+    const markerRadius = markerDiameter / 2;
+    const baseIconSize = Math.min(markerDiameter - 12, 54);
+    const badgeRadius = Math.max(10, Math.round(markerRadius * 0.34));
+
+    for (const hex of renderer.hexes) {
+      const pois = getPoisForRenderedHex(hex);
+      if (!pois?.length) continue;
+      const markerPoi = getPrimaryPoiMarkerRecord(pois);
+      const profile = getPoiMarkerShapeProfile(markerPoi, markerRadius, baseIconSize);
+      await drawExportPoiMarker(ctx, markerPoi, hex.center.x, hex.center.y, profile, pois.length, badgeRadius);
+    }
+  }
+
+  async function drawExportPoiMarker(ctx, poi, centerX, centerY, profile, count = 1, badgeRadius = 10) {
+    ctx.save();
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.shadowColor = "rgba(0, 0, 0, 0.42)";
+    ctx.shadowBlur = 5;
+    ctx.shadowOffsetY = 2;
+    ctx.fillStyle = getExportPoiMarkerFill(profile);
+    ctx.strokeStyle = "rgba(16, 11, 7, 0.96)";
+    ctx.lineWidth = 2.25;
+    drawExportPoiMarkerShape(ctx, centerX, centerY, profile);
+    ctx.fill();
+    ctx.stroke();
+    ctx.shadowColor = "transparent";
+    await drawExportPoiMarkerSymbol(ctx, poi, centerX, centerY, profile, profile.iconSize || 22);
+    if (count > 1) drawExportPoiCountBadge(ctx, centerX, centerY, profile, count, badgeRadius);
+    ctx.restore();
+  }
+
+  function getExportPoiMarkerFill(profile) {
+    return "rgba(255, 255, 255, 0.8)";
+  }
+
+  function drawExportPoiMarkerShape(ctx, centerX, centerY, profile) {
+    ctx.beginPath();
+    if (profile.kind === "settlement" || profile.kind === "waypoint") {
+      ctx.arc(centerX, centerY, profile.radius, 0, Math.PI * 2);
+      return;
+    }
+    if (profile.kind === "resource") {
+      const size = profile.size;
+      const radius = profile.cornerRadius || 4;
+      drawRoundedRectPath(ctx, centerX - size / 2, centerY - size / 2, size, size, radius);
+      return;
+    }
+    if (profile.kind === "stronghold") {
+      drawPolygonPath(ctx, buildRegularPolygonVertices(centerX, centerY, 6, profile.radius, 0));
+      return;
+    }
+    if (profile.kind === "dungeon_complex") {
+      drawPolygonPath(ctx, buildStarVertices(centerX, centerY, 8, profile.outerRadius, profile.innerRadius, -Math.PI / 2));
+      return;
+    }
+    if (profile.kind === "dungeon") {
+      drawPolygonPath(ctx, [
+        { x: centerX, y: centerY - profile.heightRadius },
+        { x: centerX + profile.widthRadius, y: centerY },
+        { x: centerX, y: centerY + profile.heightRadius },
+        { x: centerX - profile.widthRadius, y: centerY }
+      ]);
+      return;
+    }
+    drawPolygonPath(ctx, buildNotchedHexagonVertices(
+      centerX,
+      centerY,
+      profile.widthRadius,
+      profile.heightRadius,
+      profile.shoulderInset,
+      profile.sideShoulder,
+      profile.notchInset,
+      profile.notchDepth,
+      profile.compactGeometry
+    ));
+  }
+
+  function drawRoundedRectPath(ctx, x, y, width, height, radius) {
+    const r = Math.max(0, Math.min(radius, width / 2, height / 2));
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + width - r, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+    ctx.lineTo(x + width, y + height - r);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+    ctx.lineTo(x + r, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+  }
+
+  function drawPolygonPath(ctx, points = []) {
+    if (!points.length) return;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    points.slice(1).forEach(point => ctx.lineTo(point.x, point.y));
+    ctx.closePath();
+  }
+
+  function buildStarVertices(centerX, centerY, points, outerRadius, innerRadius, rotation = 0) {
+    return Array.from({ length: Math.max(2, points) * 2 }, (_, index) => {
+      const radius = index % 2 === 0 ? outerRadius : innerRadius;
+      const angle = rotation + (Math.PI * index / Math.max(2, points));
+      return {
+        x: centerX + Math.cos(angle) * radius,
+        y: centerY + Math.sin(angle) * radius
+      };
+    });
+  }
+
+  async function drawExportPoiMarkerSymbol(ctx, poi, centerX, centerY, profile, iconSize = 22) {
+    const asset = getPoiMarkerAsset(poi);
+    const icon = asset ? await getExportPoiIconImage(getPoiMarkerIconValue(poi), asset) : null;
+    if (icon) {
+      ctx.save();
+      drawExportPoiMarkerShape(ctx, centerX, centerY, profile);
+      ctx.clip();
+      ctx.drawImage(icon, centerX - iconSize / 2, centerY - iconSize / 2, iconSize, iconSize);
+      ctx.restore();
+      return;
+    }
+
+    ctx.save();
+    ctx.fillStyle = "#120d09";
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.72)";
+    ctx.lineWidth = 2;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = `700 ${Math.max(12, iconSize * 0.62)}px Georgia, serif`;
+    const glyph = getPoiGlyph(poi);
+    ctx.strokeText(glyph, centerX, centerY + 0.5);
+    ctx.fillText(glyph, centerX, centerY + 0.5);
+    ctx.restore();
+  }
+
+  function getExportPoiIconImage(iconValue, asset) {
+    const key = String(iconValue || POI_ICON_FALLBACK);
+    if (renderer.poiIconExportImages.has(key)) return renderer.poiIconExportImages.get(key);
+
+    const imagePromise = new Promise(resolve => {
+      const image = new Image();
+      const serialized = [
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${asset.viewBox}" color="#120d09">`,
+        "<style>*{vector-effect:non-scaling-stroke}</style>",
+        asset.body,
+        "</svg>"
+      ].join("");
+      const blob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      image.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(image);
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      };
+      image.src = url;
+    });
+
+    renderer.poiIconExportImages.set(key, imagePromise);
+    return imagePromise;
+  }
+
+  function drawGeneratedMapExportGeographicRegionLayer(ctx, options = {}) {
+    if (!renderer.drawing.visibleOverlays.geographic) return;
+    const drawFills = options.fills !== false;
+    const drawOutlines = options.outlines !== false;
+    const borderSegments = [];
+    const drawn = new Set();
+
+    renderer.hexes.forEach(hex => {
+      const fill = getRegionBorderColor(hex.regionId);
+      if (!fill) return;
+
+      if (drawFills) {
+        drawCanvasPolygon(ctx, hex.points, fill, 0.25);
+      }
+
+      EDGE_NAMES.forEach((edgeName, index) => {
+        const neighbor = getNeighborHex(hex, edgeName);
+        if (neighbor?.regionId === hex.regionId) return;
+        const edge = { a: hex.points[index], b: hex.points[(index + 1) % hex.points.length] };
+        const key = edgeKey(edge.a, edge.b);
+        if (drawn.has(key)) return;
+        drawn.add(key);
+        borderSegments.push({ edge, color: fill });
+      });
+    });
+
+    if (!drawOutlines) return;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 4.8;
+    ctx.globalAlpha = 0.92;
+    ctx.setLineDash([5, 5]);
+    borderSegments.forEach(({ edge, color }) => {
+      if (!color) return;
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(edge.a.x, edge.a.y);
+      ctx.lineTo(edge.b.x, edge.b.y);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  function drawGeneratedMapExportPoliticalRegionBorders(ctx) {
+    if (!renderer.drawing.visibleOverlays.political) return;
+    const borderSegments = getGeneratedMapExportRegionBorderSegments(renderer.hexes, hex => hex.politicalRegionId, false);
+    drawGeneratedMapExportRegionBorderSegments(ctx, borderSegments);
+  }
+
+  function getGeneratedMapExportRegionBorderSegments(hexes, getRegionId, treatUnclaimed = true) {
+    const borderSegments = [];
+    const drawn = new Set();
+    hexes.forEach(hex => {
+      const regionId = getRegionId(hex);
+      if (!regionId) return;
+      EDGE_NAMES.forEach((edgeName, index) => {
+        const neighbor = getNeighborHex(hex, edgeName);
+        const neighborRegionId = neighbor ? getRegionId(neighbor) : "";
+        if (neighborRegionId === regionId) return;
+        const edge = { a: hex.points[index], b: hex.points[(index + 1) % hex.points.length] };
+        const key = edgeKey(edge.a, edge.b);
+        if (drawn.has(key)) return;
+        drawn.add(key);
+        borderSegments.push({
+          edge,
+          regionColor: getRegionBorderColor(regionId),
+          neighborColor: neighborRegionId ? getRegionBorderColor(neighborRegionId) : "",
+          regionUnclaimed: treatUnclaimed ? isUnclaimedRegion(regionId) : false,
+          neighborUnclaimed: neighborRegionId ? (treatUnclaimed ? isUnclaimedRegion(neighborRegionId) : false) : true
+        });
+      });
+    });
+    return borderSegments;
+  }
+
+  function drawGeneratedMapExportRegionBorderSegments(ctx, borderSegments) {
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    borderSegments.forEach(segment => {
+      getGeneratedMapExportRegionBorderPieces(segment).forEach(piece => {
+        drawGeneratedMapExportRegionBorderPiece(ctx, piece.a, piece.b, piece.color, 9, 0.38);
+      });
+    });
+    borderSegments.forEach(segment => {
+      getGeneratedMapExportRegionBorderPieces(segment).forEach(piece => {
+        drawGeneratedMapExportRegionBorderPiece(ctx, piece.a, piece.b, piece.color, 5.5, 1);
+      });
+    });
+    ctx.restore();
+  }
+
+  function getGeneratedMapExportRegionBorderPieces(segment) {
+    const { edge, regionColor, neighborColor, regionUnclaimed, neighborUnclaimed } = segment;
+    if (regionUnclaimed && neighborUnclaimed) return [];
+    if (regionUnclaimed || !regionColor) return neighborColor ? [{ ...edge, color: neighborColor }] : [];
+    if (neighborUnclaimed || !neighborColor) return regionColor ? [{ ...edge, color: regionColor }] : [];
+    if (regionColor === neighborColor) return [{ ...edge, color: regionColor }];
+    const split = splitSharedBorder(edge);
+    return [
+      { ...split.region, color: regionColor },
+      { ...split.neighbor, color: neighborColor }
+    ];
+  }
+
+  function drawGeneratedMapExportRegionBorderPiece(ctx, a, b, color, width, alpha) {
+    if (!color) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawExportPoiCountBadge(ctx, centerX, centerY, profile, count, badgeRadius) {
+    const hostRadius = profile.radius || profile.outerRadius || profile.widthRadius || profile.size / 2 || 24;
+    const badgeX = centerX + hostRadius * 0.68;
+    const badgeY = centerY - hostRadius * 0.68;
+    ctx.save();
+    ctx.fillStyle = "rgba(255, 255, 255, 0.98)";
+    ctx.strokeStyle = "rgba(16, 11, 7, 0.96)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#120d09";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = `700 ${Math.max(10, badgeRadius + 3)}px Georgia, serif`;
+    ctx.fillText(String(Math.min(count, 9)), badgeX, badgeY + 0.5);
+    ctx.restore();
+  }
+
+  async function waitForFeatureImagesForExport(timeoutMs = 10000) {
+    const startedAt = performance.now();
+    while (
+      (renderer.featureImageQueue.length || renderer.featureImageActiveLoads > 0) &&
+      performance.now() - startedAt < timeoutMs
+    ) {
+      processFeatureImageQueue();
+      await sleep(80);
+    }
+  }
+
+  async function drawGeneratedMapExportSvgLayers(ctx, scale, width, height) {
+    const savedView = {
+      zoom: renderer.view.zoom,
+      panX: renderer.view.panX,
+      panY: renderer.view.panY
+    };
+    const savedRegionOverlays = {
+      geographic: renderer.drawing.visibleOverlays.geographic,
+      political: renderer.drawing.visibleOverlays.political
+    };
+    try {
+      renderer.view.zoom = 1;
+      renderer.view.panX = 0;
+      renderer.view.panY = 0;
+      renderer.svgLayerKey = "";
+      renderer.labelLayerKey = "";
+      renderer.poiLayerKey = "";
+      const viewport = { width: renderer.view.width, height: renderer.view.height };
+      renderer.drawing.visibleOverlays.geographic = false;
+      renderer.drawing.visibleOverlays.political = false;
+      renderSvg(viewport, renderer.hexes, []);
+      renderer.drawing.visibleOverlays.geographic = savedRegionOverlays.geographic;
+      renderer.drawing.visibleOverlays.political = savedRegionOverlays.political;
+      renderLabelLayer(viewport, renderer.hexes, { reuse: false });
+
+      const results = await Promise.allSettled([
+        drawSvgElementToCanvas(ctx, renderer.svg, scale, width, height, "map overlay"),
+        drawSvgElementToCanvas(ctx, renderer.labelSvg, scale, width, height, "labels")
+      ]);
+      return results
+        .filter(result => result.status === "rejected")
+        .map(result => result.reason?.message || "Could not render SVG export layer.");
+    } finally {
+      renderer.view.zoom = savedView.zoom;
+      renderer.view.panX = savedView.panX;
+      renderer.view.panY = savedView.panY;
+      renderer.drawing.visibleOverlays.geographic = savedRegionOverlays.geographic;
+      renderer.drawing.visibleOverlays.political = savedRegionOverlays.political;
+      renderer.svgLayerKey = "";
+      renderer.labelLayerKey = "";
+      renderer.poiLayerKey = "";
+      const wasExportingMap = renderer.exportingMap;
+      renderer.exportingMap = false;
+      render({ skipClamp: true });
+      renderer.exportingMap = wasExportingMap;
+    }
+  }
+
+  function drawSvgElementToCanvas(ctx, svgElement, scale, width, height, layerName = "SVG layer") {
+    if (!svgElement?.childNodes?.length) return Promise.resolve();
+    const clone = svgElement.cloneNode(true);
+    clone.querySelectorAll(".generated-map-grid-lines, .generated-map-subhex-grid-lines").forEach(node => node.remove());
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("width", String(width));
+    clone.setAttribute("height", String(height));
+    clone.setAttribute("viewBox", `0 0 ${renderer.view.width} ${renderer.view.height}`);
+    clone.setAttribute("preserveAspectRatio", "none");
+
+    const style = document.createElementNS("http://www.w3.org/2000/svg", "style");
+    style.textContent = getGeneratedMapExportSvgStyle();
+    clone.insertBefore(style, clone.firstChild);
+
+    const serialized = new XMLSerializer().serializeToString(clone);
+    const image = new Image();
+    const blob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    return new Promise((resolve, reject) => {
+      image.onload = () => {
+        try {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.drawImage(image, 0, 0, width, height);
+          resolve();
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error(`Could not render ${layerName}.`));
+      };
+      image.src = url;
+    });
+  }
+
+  function getGeneratedMapExportSvgStyle() {
+    const rules = [];
+    Array.from(document.styleSheets || []).forEach(sheet => {
+      try {
+        Array.from(sheet.cssRules || []).forEach(rule => {
+          const text = rule?.cssText || "";
+          if (text.includes("generated-map-")) rules.push(text);
+        });
+      } catch {}
+    });
+    return rules.join("\n");
+  }
+
+  function downloadCanvasPng(canvas, filename) {
+    return new Promise((resolve, reject) => {
+      try {
+        canvas.toBlob(blob => {
+          if (!blob) {
+            reject(new Error("PNG encoding failed."));
+            return;
+          }
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+          resolve();
+        }, "image/png");
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
   function shouldDeferOverlayCacheRefresh() {
     if (!renderer.routeCacheDirty && !renderer.overlayCacheDirty) return false;
     return renderer.cacheDirty
@@ -8011,12 +8612,13 @@
   function renderCoordinateLabels(fragment) {
     if (renderer.view.zoom < COORD_LABEL_MIN_ZOOM || !renderer.drawing.visibleOverlays.coords) return;
     const dimensions = getGeneratedMapDimensions();
+    const labelScale = renderer.exportingMap ? EXPORT_COORD_LABEL_SCALE : 1;
     renderer.hexes.forEach(hex => {
       const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
       text.setAttribute("class", "generated-map-coord-label");
       text.setAttribute("x", String(hex.center.x));
       text.setAttribute("y", String(hex.center.y - dimensions.hexHeight * 0.37));
-      text.setAttribute("font-size", String(dimensions.radius * 0.2));
+      text.setAttribute("font-size", String(dimensions.radius * 0.2 * labelScale));
       text.textContent = hex.label;
       fragment.appendChild(text);
     });
